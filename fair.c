@@ -108,6 +108,26 @@ unsigned int sysctl_sched_child_runs_first __read_mostly;
 
 const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
 
+pid_t current_drm_top_pid = 0;
+
+/* 1. The Setter: Called by your DRM driver */
+void set_drm_top_app(struct task_struct *p)
+{
+    if (p) {
+        current_drm_top_pid = p->tgid;
+    }
+}
+EXPORT_SYMBOL_GPL(set_drm_top_app); // Export it for vs_drm.ko
+
+/* 2. The Checker: Used internally by the scheduler */
+bool is_drm_top_app(struct task_struct *p)
+{
+    if (!p) return false;
+
+    /* Check if this task's Thread Group ID matches the DRM top app */
+    return (p->tgid == current_drm_top_pid);
+}
+
 int sched_thermal_decay_shift;
 static int __init setup_sched_thermal_decay_shift(char *str)
 {
@@ -9520,14 +9540,6 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 	struct sched_entity *se = &prev->se;
 	struct cfs_rq *cfs_rq;
 
-	if (prev->uclamp_req[UCLAMP_MIN].value == 800) {
-        prev->uclamp_req[UCLAMP_MIN].value = 0;
-        prev->uclamp_req[UCLAMP_MIN].active = 0;
-
-        /* Signal the governor that a high-freq requirement was dropped */
-        cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
-    }
-
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		put_prev_entity(cfs_rq, se);
@@ -14067,14 +14079,6 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &curr->se;
 
-	if (curr->uclamp_req[UCLAMP_MIN].value == 800 &&
-        time_after(jiffies, curr->boost_expires)) {
-
-        curr->uclamp_req[UCLAMP_MIN].value = 0;
-        curr->uclamp_req[UCLAMP_MIN].active = 0;
-        cpufreq_update_util(rq, 0);
-    }
-
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		entity_tick(cfs_rq, se, queued);
@@ -14616,17 +14620,6 @@ static unsigned int get_rr_interval_fair(struct rq *rq, struct task_struct *task
 
 	return rr_interval;
 }
-
-void boost_app_task(struct task_struct *p) {
-    if (!p) return;
-
-	p->boost_expires = jiffies + msecs_to_jiffies(50);
-
-    /* 2. Frequency Boost: Force the CPU to max frequency for this task. */
-    p->uclamp_req[UCLAMP_MIN].value = 800;
-    p->uclamp_req[UCLAMP_MIN].active = 1;
-}
-EXPORT_SYMBOL_GPL(boost_app_task);
 
 /*
  * All the scheduling class methods:
