@@ -117,7 +117,7 @@ void set_drm_top_app(struct task_struct *p)
         current_drm_top_pid = p->tgid;
     }
 }
-EXPORT_SYMBOL_GPL(set_drm_top_app); // Export it for vs_drm.ko
+EXPORT_SYMBOL_GPL(set_drm_top_app);
 
 /* 2. The Checker: Used internally by the scheduler */
 bool is_drm_top_app(struct task_struct *p)
@@ -126,6 +126,43 @@ bool is_drm_top_app(struct task_struct *p)
 
     /* Check if this task's Thread Group ID matches the DRM top app */
     return (p->tgid == current_drm_top_pid);
+}
+
+/* State tracking */
+static int active_swipe_type = SWIPE_NONE;
+static unsigned long swipe_expiry_jiffies = 0;
+
+/**
+ * sched_set_swipe_state - Set by the touch driver
+ * @type: SWIPE_LIGHT, SWIPE_MIDDLE, SWIPE_STRONG
+ * @duration_ms: How long the scroll effect lasts
+ */
+void sched_set_swipe_state(int type, unsigned int duration_ms)
+{
+    swipe_expiry_jiffies = jiffies + msecs_to_jiffies(duration_ms);
+    /* Memory barrier to ensure expiry is updated before type */
+    smp_wmb();
+    active_swipe_type = type;
+}
+EXPORT_SYMBOL_GPL(sched_set_swipe_state);
+
+/**
+ * sched_get_current_swipe - Fast lockless check for the scheduler
+ */
+int sched_get_current_swipe(void)
+{
+    int type = active_swipe_type;
+
+    if (type == SWIPE_NONE)
+        return SWIPE_NONE;
+
+    /* Check if the scroll duration has expired */
+    if (time_after(jiffies, swipe_expiry_jiffies)) {
+        active_swipe_type = SWIPE_NONE;
+        return SWIPE_NONE;
+    }
+
+    return type;
 }
 
 int sched_thermal_decay_shift;
