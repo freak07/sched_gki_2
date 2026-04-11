@@ -1670,10 +1670,57 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 	struct uclamp_se uc_max = uclamp_default[clamp_id];
 	struct uclamp_se uc_eff;
 	int ret = 0;
+	bool is_cold_launching = false;
 
 	trace_android_rvh_uclamp_eff_get(p, clamp_id, &uc_max, &uc_eff, &ret);
 	if (ret)
 		return uc_eff;
+
+	if (clamp_id == UCLAMP_MIN) {
+        // 1. Check Cold Launch First
+        if (unlikely(p->cold_launch_boost_end)) {
+            if (time_before(jiffies, p->cold_launch_boost_end)) {
+                // Force the requested clamp to the maximum scale (1024 / 100%)
+                uc_req.value = max_t(unsigned int, uc_req.value, SCHED_CAPACITY_SCALE);
+                is_cold_launching = true; // Mark it as active
+            } else {
+                // 3 seconds have passed. Clear the variable.
+                p->cold_launch_boost_end = 0;
+            }
+        }
+
+        // 2. Only check for swipes if we AREN'T cold launching
+        if (unlikely(!is_cold_launching && is_drm_top_app(p))) {
+            int swipe_state = sched_get_current_swipe();
+
+            if (swipe_state != SWIPE_NONE) {
+                unsigned int boost_val = uc_req.value;
+
+                switch (swipe_state) {
+                case SWIPE_LIGHT:
+                    boost_val = max(boost_val, 512U); /* ~30% capacity */
+                    break;
+                case SWIPE_MIDDLE:
+                    boost_val = max(boost_val, 512U); /* ~50% capacity */
+                    break;
+                case SWIPE_STRONG:
+                    boost_val = max(boost_val, 768U); /* ~75% capacity */
+                    break;
+                case SWIPE_HORIZONTAL:
+                    boost_val = max(boost_val, 638U); /* ~75% capacity */
+                    break;
+                case SWIPE_TOUCH_DOWN:
+                    boost_val = max(boost_val, 638U); /* ~75% capacity */
+                    break;
+                }
+
+                if (boost_val > uc_req.value) {
+                    boost_val = min(boost_val, (unsigned int)SCHED_CAPACITY_SCALE);
+                    uclamp_se_set(&uc_req, boost_val, false);
+                }
+            }
+        }
+    }
 
 	/* System default restrictions always apply */
 	if (unlikely(uc_req.value > uc_max.value))
@@ -5065,6 +5112,15 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	trace_android_rvh_sched_fork(p);
 
 	__sched_fork(clone_flags, p);
+#if 0
+	if (!strncmp(current->comm, "zygote", 6) && p->pid == p->tgid) {
+		p->cold_launch_boost_end = jiffies + (3 * HZ);
+		pr_err("ColdLaunchBoost: Detected launch from %s! Assigned boost to pid %d\n",
+			current->comm, p->pid);
+	} else {
+		p->cold_launch_boost_end = 0;
+	}
+#endif
 	/*
 	 * We mark the process as NEW here. This guarantees that
 	 * nobody will actually run it, and a signal or other external
@@ -5192,6 +5248,18 @@ void wake_up_new_task(struct task_struct *p)
 	struct rq *rq;
 
 	trace_android_rvh_wake_up_new_task(p);
+
+	//pr_err("APP_TRACE_ALL: Parent Name: [%s] (PID: %d) created Child Name: [%s] (PID: %d)\n",
+	//	current->comm, current->pid, p->comm, p->pid);
+
+	if (!strncmp(current->comm, "main", 4) && p->pid == p->tgid) {
+		p->cold_launch_boost_end = jiffies + (3 * HZ);
+
+		pr_err("ColdLaunchBoost: Detected launch! Parent %s (PID %d) created new app PID %d\n",
+			current->comm, current->pid, p->pid);
+	} else {
+		p->cold_launch_boost_end = 0;
+	}
 
 	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
 	WRITE_ONCE(p->__state, TASK_RUNNING);

@@ -807,7 +807,7 @@ void update_zero_vruntime(struct cfs_rq *cfs_rq, s64 delta)
  * Called in:
  *  - place_entity()      -- before enqueue
  *  - update_entity_lag() -- before dequeue
- *  - entity_tick()
+ *  - update_deadline()   -- slice expiration
  *
  * This means it is one entry 'behind' but that puts it close enough to where
  * the bound on entity_key() is at most two lag bounds.
@@ -1224,6 +1224,13 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	if (skip_preempt)
 		return false;
 
+	if (entity_is_task(se)) {
+		struct task_struct *p = task_of(se);
+		if (unlikely(p->cold_launch_boost_end && time_before(jiffies, p->cold_launch_boost_end))) {
+			return false;
+		}
+	}
+
 	if (vruntime_cmp(se->vruntime, "<", se->deadline))
 		return false;
 
@@ -1239,6 +1246,7 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	 * EEVDF: vd_i = ve_i + r_i / w_i
 	 */
 	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
+	avg_vruntime(cfs_rq);
 
 	/*
 	 * The task has consumed its request, reschedule.
@@ -1332,6 +1340,10 @@ void post_init_entity_util_avg(struct task_struct *p)
 			sa->util_avg = cap;
 		}
 	}
+
+	if (unlikely(p->cold_launch_boost_end)) {
+        sa->util_avg = SCHED_CAPACITY_SCALE;
+    }
 
 	sa->runnable_avg = sa->util_avg;
 
@@ -5257,6 +5269,13 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
 	unsigned long uclamp_min = uclamp_eff_value(p, UCLAMP_MIN);
 	unsigned long uclamp_max = uclamp_eff_value(p, UCLAMP_MAX);
 	unsigned long util = task_util_est(p);
+	bool fits = true, done = false;
+
+	trace_android_rvh_task_fits_cpu(p, util, uclamp_min, uclamp_max, cpu, &fits, &done);
+
+	if (done)
+		return fits;
+
 	/*
 	 * Return true only if the cpu fully fits the task requirements, which
 	 * include the utilization but also the performance hints.
@@ -5524,6 +5543,38 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * EEVDF: vd_i = ve_i + r_i/w_i
 	 */
 	se->deadline = se->vruntime + vslice;
+
+	if (entity_is_task(se)) {
+        struct task_struct *p = task_of(se);
+
+        if (unlikely(p->cold_launch_boost_end && time_before(jiffies, p->cold_launch_boost_end))) {
+            /* * Subtract a massive amount from both vruntime and deadline.
+             * This guarantees EEVDF sees this task as having the highest
+             * eligibility and the most urgent deadline in the entire runqueue.
+             */
+            u64 boost_amount = vslice * 5;
+            se->vruntime -= boost_amount;
+            se->deadline -= boost_amount;
+        }
+
+        if (unlikely(is_drm_top_app(p))) {
+            int swipe_state = sched_get_current_swipe();
+
+            if (swipe_state == SWIPE_MIDDLE || swipe_state == SWIPE_STRONG ||
+				swipe_state == SWIPE_HORIZONTAL || swipe_state == SWIPE_TOUCH_DOWN) {
+                /*
+                 * Subtract 3x of its allotted slice from both vruntime
+                 * and deadline. This guarantees it evaluates as the most
+                 * eligible task with the most urgent deadline in the queue.
+                 */
+                u64 boost_amount = vslice * 3;
+                se->vruntime -= boost_amount;
+                se->deadline -= boost_amount;
+                //pr_err("SwipeBoost: [EEVDF] Cheating vruntime/deadline for %s (pid %d) by %llu, swipe=%d\n",
+                //                    p->comm, p->pid, (unsigned long long)boost_amount, swipe_state);
+            }
+        }
+    }
 	trace_android_rvh_place_entity(cfs_rq, se, flags, &vruntime);
 }
 
@@ -5863,11 +5914,6 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 	 */
 	update_load_avg(cfs_rq, curr, UPDATE_TG);
 	update_cfs_group(curr);
-
-	/*
-	 * Pulls along cfs_rq::zero_vruntime.
-	 */
-	avg_vruntime(cfs_rq);
 
 #ifdef CONFIG_SCHED_HRTICK
 	/*
@@ -9159,6 +9205,24 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	/* SD_flags and WF_flags share the first nibble */
 	int sd_flag = wake_flags & 0xF;
 
+	bool boost_placement = false;
+    bool search_top_down = false; // True = prioritize Prime (7), False = prioritize Perf (2)
+
+    // 1. Check if the 3-second Cold Launch boost is active
+    if (unlikely(p->cold_launch_boost_end && time_before(jiffies, p->cold_launch_boost_end))) {
+        boost_placement = true;
+        search_top_down = true; // Cold launch: Need max burst power (7->2)
+    }
+    // 2. Otherwise, check if the DRM Swipe boost is active
+    else if (unlikely(is_drm_top_app(p))) {
+        int swipe_state = sched_get_current_swipe();
+        if (swipe_state == SWIPE_MIDDLE || swipe_state == SWIPE_STRONG ||
+			swipe_state == SWIPE_HORIZONTAL || swipe_state == SWIPE_TOUCH_DOWN) {
+            boost_placement = true;
+            search_top_down = false; // Scrolling: Need sustained efficiency (2->7)
+        }
+    }
+
 	time = schedstat_start_time();
 
 	if (trace_android_rvh_select_task_rq_fair_enabled() &&
@@ -9168,6 +9232,58 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 			wake_flags, &target_cpu);
 	if (target_cpu >= 0)
 		return target_cpu;
+
+	if (unlikely(boost_placement)) {
+        int i, target_big = -1;
+
+        /* 1. Try to find a completely IDLE Big/Prime core based on the optimal direction. */
+        if (search_top_down) {
+            for (i = 7; i >= 2; i--) {
+                if (cpumask_test_cpu(i, p->cpus_ptr) && available_idle_cpu(i)) {
+                    target_big = i;
+                    break;
+                }
+            }
+        } else {
+            for (i = 2; i <= 7; i++) {
+                if (cpumask_test_cpu(i, p->cpus_ptr) && available_idle_cpu(i)) {
+                    target_big = i;
+                    break;
+                }
+            }
+        }
+
+        /* 2. If no big cores are idle, stick to prev_cpu if it's already a Big core (cache warmth) */
+        if (target_big == -1 && prev_cpu >= 2 && cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+            target_big = prev_cpu;
+        }
+
+        /* 3. If it was on a Little core, force it to the highest allowed Big/Prime core
+         * matching the same search direction as step 1.
+         */
+        if (target_big == -1) {
+            if (search_top_down) {
+                for (i = 7; i >= 2; i--) {
+                    if (cpumask_test_cpu(i, p->cpus_ptr)) {
+                        target_big = i;
+                        break;
+                    }
+                }
+            } else {
+                for (i = 2; i <= 7; i++) {
+                    if (cpumask_test_cpu(i, p->cpus_ptr)) {
+                        target_big = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        /* If we successfully found a Big/Prime core, bypass EAS and return it immediately */
+        if (target_big >= 2) {
+            return target_big;
+        }
+    }
 
 	/*
 	 * required for stable ->cpus_allowed
@@ -9320,7 +9436,16 @@ static void check_preempt_wakeup_fair(struct rq *rq, struct task_struct *p, int 
 
 	if (unlikely(se == pse))
 		return;
-
+#if 0
+	if (unlikely(is_drm_top_app(p))) {
+		int swipe = sched_get_current_swipe();
+		if (swipe == SWIPE_MIDDLE || swipe == SWIPE_STRONG) {
+			/* Instantly preempt the current running task to run the top app */
+			resched_curr(rq);
+			return;
+		}
+	}
+#endif
 	/*
 	 * This is possible from callers such as attach_tasks(), in which we
 	 * unconditionally wakeup_preempt() after an enqueue (which may have
@@ -9629,7 +9754,7 @@ static void yield_task_fair(struct rq *rq)
 	 */
 	if (entity_eligible(cfs_rq, se)) {
 		se->vruntime = se->deadline;
-		se->deadline += calc_delta_fair(se->slice, se);
+		update_deadline(cfs_rq, se);
 	}
 }
 
