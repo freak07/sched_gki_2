@@ -1603,6 +1603,8 @@ select_task_rq_rt(struct task_struct *p, int cpu, int flags)
 	int target_cpu = -1;
 	bool sync = !!(flags & WF_SYNC);
 	int this_cpu;
+	bool boost_rt_placement = false;
+	bool idle_rt_placement = false;
 
 	trace_android_rvh_select_task_rq_rt(p, cpu, flags & 0xF,
 					flags, &target_cpu);
@@ -1612,6 +1614,42 @@ select_task_rq_rt(struct task_struct *p, int cpu, int flags)
 	/* For anything but wake ups, just return the task_cpu */
 	if (!(flags & (WF_TTWU | WF_FORK)))
 		goto out;
+
+	if (unlikely(p->cold_launch_boost_end && time_before(jiffies, p->cold_launch_boost_end))) {
+        boost_rt_placement = true;
+    } else if (unlikely(is_drm_top_app(p) && sched_get_current_swipe() != SWIPE_NONE)) {
+        boost_rt_placement = true;
+    } else if (unlikely(sched_get_display_idle())) {
+        idle_rt_placement = true;
+    }
+
+    if (unlikely(boost_rt_placement)) {
+        int i;
+        /* PERFORMANCE: Force top-down search (Prime -> Big) for max IPC */
+        for (i = 7; i >= 2; i--) {
+            if (cpu_online(i) && cpumask_test_cpu(i, p->cpus_ptr)) {
+                struct rq *target_rq = cpu_rq(i);
+                if (available_idle_cpu(i) || READ_ONCE(target_rq->curr)->policy != SCHED_FIFO) {
+                    return i;
+                }
+            }
+        }
+    }
+    else if (unlikely(idle_rt_placement)) {
+        int i;
+        /* BATTERY: Force bottom-up search across Little/Mid cores (0 -> 4).
+         * This actively pulls RT tasks off the Prime cores when the screen turns off.
+         */
+        for (i = 4; i >= 0; i--) {
+            if (cpu_online(i) && cpumask_test_cpu(i, p->cpus_ptr)) {
+                struct rq *target_rq = cpu_rq(i);
+                /* If the core is idle, or running a normal CFS task we can preempt, take it */
+                if (available_idle_cpu(i) || READ_ONCE(target_rq->curr)->policy != SCHED_FIFO) {
+                    return i;
+                }
+            }
+        }
+    }
 
 	rq = cpu_rq(cpu);
 
@@ -1895,6 +1933,7 @@ static int find_lowest_rq(struct task_struct *task)
 	int this_cpu = smp_processor_id();
 	int cpu      = -1;
 	int ret;
+	bool boost_rt_placement = false;
 
 	/* Make sure the mask is initialized first */
 	if (unlikely(!lowest_mask))
@@ -1927,6 +1966,43 @@ static int find_lowest_rq(struct task_struct *task)
 
 	if (!ret)
 		return -1; /* No targets found */
+
+	bool display_idle = sched_get_display_idle();
+
+	if (unlikely(task->cold_launch_boost_end && time_before(jiffies, task->cold_launch_boost_end))) {
+        boost_rt_placement = true;
+    } else if (unlikely(is_drm_top_app(task) && sched_get_current_swipe() != SWIPE_NONE)) {
+        boost_rt_placement = true;
+    }
+
+    if (unlikely(boost_rt_placement)) {
+        struct cpumask backup_mask;
+        cpumask_copy(&backup_mask, lowest_mask);
+
+        /* Strip out Little cores from the valid target list */
+        cpumask_clear_cpu(0, lowest_mask);
+        cpumask_clear_cpu(1, lowest_mask);
+
+        /* Failsafe: If clearing CPUs 0 and 1 left us with NO available targets,
+         * restore the backup to prevent breaking the RT push logic. */
+        if (cpumask_empty(lowest_mask)) {
+            cpumask_copy(lowest_mask, &backup_mask);
+        }
+    }
+    else if (unlikely(display_idle)) {
+        struct cpumask backup_mask;
+        cpumask_copy(&backup_mask, lowest_mask);
+
+        /* BATTERY: Strip out Big/Prime cores (5, 6, 7) from valid targets */
+        cpumask_clear_cpu(5, lowest_mask);
+        cpumask_clear_cpu(6, lowest_mask);
+        cpumask_clear_cpu(7, lowest_mask);
+
+        /* Failsafe: If clearing Big cores left us with no targets, restore backup */
+        if (cpumask_empty(lowest_mask)) {
+            cpumask_copy(lowest_mask, &backup_mask);
+        }
+    }
 
 	cpu = task_cpu(task);
 
@@ -1990,13 +2066,22 @@ static int find_lowest_rq(struct task_struct *task)
 
 static struct task_struct *pick_next_pushable_task(struct rq *rq)
 {
-	struct task_struct *p;
+	struct plist_head *head = &rq->rt.pushable_tasks;
+	struct task_struct *i, *p = NULL;
 
 	if (!has_pushable_tasks(rq))
 		return NULL;
 
-	p = plist_first_entry(&rq->rt.pushable_tasks,
-			      struct task_struct, pushable_tasks);
+	plist_for_each_entry(i, head, pushable_tasks) {
+		/* make sure task isn't on_cpu (possible with proxy-exec) */
+		if (!task_on_cpu(rq, i)) {
+			p = i;
+			break;
+		}
+	}
+
+	if (!p)
+		return NULL;
 
 	BUG_ON(rq->cpu != task_cpu(p));
 	BUG_ON(task_current(rq, p));
