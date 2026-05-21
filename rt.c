@@ -475,7 +475,7 @@ static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 	if (cpu >= 5 && min_cap < 490)
 		return false;
 
-	cpu_cap = capacity_orig_of(cpu);
+	cpu_cap = arch_scale_cpu_capacity(cpu);
 
 	return cpu_cap >= min(min_cap, max_cap);
 }
@@ -1778,6 +1778,12 @@ static void wakeup_preempt_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *donor = rq->donor;
 
+	/*
+	 * XXX If we're preempted by DL, queue a push?
+	 */
+	if (p->sched_class != &rt_sched_class)
+		return;
+
 	if (p->prio < donor->prio) {
 		resched_curr(rq);
 		return;
@@ -2810,7 +2816,6 @@ static int task_is_throttled_rt(struct task_struct *p, int cpu)
 #endif
 
 DEFINE_SCHED_CLASS(rt) = {
-
 	.enqueue_task		= enqueue_task_rt,
 	.dequeue_task		= dequeue_task_rt,
 	.yield_task		= yield_task_rt,
